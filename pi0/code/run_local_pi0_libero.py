@@ -188,38 +188,25 @@ def build_model_inputs(
 
 def get_env_action_bounds_and_dim(env) -> tuple[np.ndarray, np.ndarray, int]:
     """
-    Return flattened action bounds and action dimension across API variants.
-    Supports gym-style `action_space`, robosuite-style `action_spec`, and `action_dim`.
+    Return flattened action bounds and action dimension for LIBERO OffScreenRenderEnv.
+
+    In huggingface/lerobot-libero, OffScreenRenderEnv is a wrapper with the underlying
+    robosuite env stored at `env.env`. robosuite exposes action bounds via `action_spec`.
     """
-    action_space = getattr(env, "action_space", None)
-    if action_space is not None and hasattr(action_space, "shape"):
-        dim = int(np.prod(action_space.shape))
-        low = np.asarray(action_space.low, dtype=np.float32).reshape(-1)
-        high = np.asarray(action_space.high, dtype=np.float32).reshape(-1)
-        return low, high, dim
+    if not hasattr(env, "env"):
+        raise AttributeError("Expected OffScreenRenderEnv wrapper to have `.env` attribute.")
 
-    action_spec = getattr(env, "action_spec", None)
-    if action_spec is not None:
-        spec = action_spec() if callable(action_spec) else action_spec
-        if isinstance(spec, (tuple, list)) and len(spec) == 2:
-            low = np.asarray(spec[0], dtype=np.float32).reshape(-1)
-            high = np.asarray(spec[1], dtype=np.float32).reshape(-1)
-            if low.shape != high.shape:
-                raise ValueError(
-                    f"Inconsistent action bounds shapes from env.action_spec: low={low.shape}, high={high.shape}"
-                )
-            return low, high, int(low.size)
+    if not hasattr(env.env, "action_spec"):
+        raise AttributeError("Expected underlying robosuite env to expose `.action_spec`.")
 
-    action_dim = getattr(env, "action_dim", None)
-    if action_dim is not None:
-        dim = int(action_dim)
-        low = -np.ones(dim, dtype=np.float32)
-        high = np.ones(dim, dtype=np.float32)
-        return low, high, dim
-
-    raise AttributeError(
-        "Cannot infer environment action interface. Expected one of: action_space, action_spec, action_dim."
-    )
+    low, high = env.env.action_spec
+    low = np.asarray(low, dtype=np.float32).reshape(-1)
+    high = np.asarray(high, dtype=np.float32).reshape(-1)
+    if low.shape != high.shape:
+        raise ValueError(
+            f"Inconsistent action bounds shapes from env.env.action_spec: low={low.shape}, high={high.shape}"
+        )
+    return low, high, int(low.size)
 
 
 def to_env_action(action: torch.Tensor, env) -> np.ndarray:
