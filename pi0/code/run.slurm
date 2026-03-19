@@ -1,4 +1,4 @@
-﻿#!/bin/bash
+#!/bin/bash
 
 #SBATCH --job-name=run_pi0           # 作业名
 #SBATCH --partition=gpuB                # 使用 gpuB 分区
