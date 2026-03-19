@@ -1,4 +1,4 @@
-#!/bin/bash
+﻿#!/bin/bash
 
 #SBATCH --job-name=run_pi0           # 作业名
 #SBATCH --partition=gpuB                # 使用 gpuB 分区
@@ -14,8 +14,6 @@
 # 加载环境模块
 module load anaconda3-2024.10-1
 
-
-# 初始化 Conda
 __conda_setup="$('/seu_share/apps/anaconda3-2024.10-1/bin/conda' 'shell.bash' 'hook' 2> /dev/null)"
 if [ $? -eq 0 ]; then
     eval "$__conda_setup"
@@ -28,25 +26,24 @@ else
 fi
 unset __conda_setup
 
-# 激活环境
 conda activate pi0l
 
 export WANDB_MODE=offline
 
 cd /seu_share2/home/linli/213221090/ai-learning/pi0/code
 
-# export PYTHONPATH=$PYTHONPATH:$(pwd)/src
+export MODEL_ROOT=/seu_nvme/home/linli/213221090/MyModels
+export DATA_ROOT=/seu_nvme/home/linli/213221090/MyDatasets
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 
-# 执行命令
 python run_local_pi0_libero.py \
-  --policy-path /seu_nvme/home/linli/213221090/MyModels/lerobot/pi0_libero_finetuned \
+  --policy-path "$MODEL_ROOT/lerobot/pi0_libero_finetuned" \
+  --tokenizer-path "$MODEL_ROOT/google/paligemma-3b-pt-224" \
+  --local-files-only \
   --suite libero_object \
   --task-id 0 \
   --episodes 1 \
   --steps 200 \
   --trace \
   --debug
-
-

@@ -26,6 +26,14 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument("--policy-path", type=str, default="lerobot/pi0_libero_finetuned")
+    parser.add_argument(
+        "--tokenizer-path",
+        type=str,
+        default="google/paligemma-3b-pt-224",
+        help=(
+            "Tokenizer source. openpi / lerobot pi0 use PaliGemma tokenizer."
+        ),
+    )
     parser.add_argument("--cache-dir", type=str, default=None)
     parser.add_argument("--local-files-only", action="store_true")
 
@@ -219,6 +227,31 @@ def to_env_action(action: torch.Tensor, env) -> np.ndarray:
     return np.clip(a, low, high).astype(np.float32)
 
 
+def load_pi0_tokenizer(
+    tokenizer_path: str,
+    cache_dir: str | None,
+    local_files_only: bool,
+):
+    """
+    openpi / lerobot pi0 stack uses the PaliGemma tokenizer (slow path).
+    """
+    try:
+        return AutoTokenizer.from_pretrained(
+            tokenizer_path,
+            cache_dir=cache_dir,
+            local_files_only=local_files_only,
+            use_fast=False,
+        )
+    except Exception as e:
+        msg = str(e).lower()
+        if "sentencepiece" in msg:
+            raise RuntimeError(
+                "Failed to load PI0 tokenizer: sentencepiece is required for the slow PaliGemma tokenizer. "
+                "Install `sentencepiece` in your Linux env and retry."
+            ) from e
+        raise
+
+
 def main() -> None:
     args = parse_args()
     device = pick_device(args.device)
@@ -235,10 +268,10 @@ def main() -> None:
             cache_dir=args.cache_dir,
             local_files_only=args.local_files_only,
         )
-        tokenizer = AutoTokenizer.from_pretrained(
-            str(ckpt_dir),
-            local_files_only=True,  # already resolved to local dir
-            use_fast=True,
+        tokenizer = load_pi0_tokenizer(
+            tokenizer_path=args.tokenizer_path,
+            cache_dir=args.cache_dir,
+            local_files_only=args.local_files_only,
         )
 
         # 3) Infer state dim from the first observation.
