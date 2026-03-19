@@ -186,15 +186,49 @@ def build_model_inputs(
     return images, state, input_ids, attention_mask
 
 
+def get_env_action_bounds_and_dim(env) -> tuple[np.ndarray, np.ndarray, int]:
+    """
+    Return flattened action bounds and action dimension across API variants.
+    Supports gym-style `action_space`, robosuite-style `action_spec`, and `action_dim`.
+    """
+    action_space = getattr(env, "action_space", None)
+    if action_space is not None and hasattr(action_space, "shape"):
+        dim = int(np.prod(action_space.shape))
+        low = np.asarray(action_space.low, dtype=np.float32).reshape(-1)
+        high = np.asarray(action_space.high, dtype=np.float32).reshape(-1)
+        return low, high, dim
+
+    action_spec = getattr(env, "action_spec", None)
+    if action_spec is not None:
+        spec = action_spec() if callable(action_spec) else action_spec
+        if isinstance(spec, (tuple, list)) and len(spec) == 2:
+            low = np.asarray(spec[0], dtype=np.float32).reshape(-1)
+            high = np.asarray(spec[1], dtype=np.float32).reshape(-1)
+            if low.shape != high.shape:
+                raise ValueError(
+                    f"Inconsistent action bounds shapes from env.action_spec: low={low.shape}, high={high.shape}"
+                )
+            return low, high, int(low.size)
+
+    action_dim = getattr(env, "action_dim", None)
+    if action_dim is not None:
+        dim = int(action_dim)
+        low = -np.ones(dim, dtype=np.float32)
+        high = np.ones(dim, dtype=np.float32)
+        return low, high, dim
+
+    raise AttributeError(
+        "Cannot infer environment action interface. Expected one of: action_space, action_spec, action_dim."
+    )
+
+
 def to_env_action(action: torch.Tensor, env) -> np.ndarray:
     a = action.detach().to("cpu").float().numpy().reshape(-1)
-    env_dim = int(np.prod(env.action_space.shape))
+    low, high, env_dim = get_env_action_bounds_and_dim(env)
     if a.shape[0] > env_dim:
         a = a[:env_dim]
     elif a.shape[0] < env_dim:
         a = np.concatenate([a, np.zeros(env_dim - a.shape[0], dtype=np.float32)], axis=0)
-    low = np.asarray(env.action_space.low, dtype=np.float32).reshape(-1)
-    high = np.asarray(env.action_space.high, dtype=np.float32).reshape(-1)
     return np.clip(a, low, high).astype(np.float32)
 
 
@@ -204,121 +238,126 @@ def main() -> None:
 
     # 1) Build environment first to infer action/state dimensions.
     env, task_suite, task, init_states = make_libero_env(args)
-    env_action_dim = int(np.prod(env.action_space.shape))
-    task_instruction = args.instruction or getattr(task, "language", "")
+    try:
+        _, _, env_action_dim = get_env_action_bounds_and_dim(env)
+        task_instruction = args.instruction or getattr(task, "language", "")
 
-    # 2) Resolve checkpoint directory and tokenizer.
-    ckpt_dir = resolve_hf_checkpoint_dir(
-        args.policy_path,
-        cache_dir=args.cache_dir,
-        local_files_only=args.local_files_only,
-    )
-    tokenizer = AutoTokenizer.from_pretrained(
-        str(ckpt_dir),
-        local_files_only=True,  # already resolved to local dir
-        use_fast=True,
-    )
-
-    # 3) Infer state dim from the first observation.
-    env.reset()
-    init_state = init_states[args.init_state_id % len(init_states)]
-    obs0 = env.set_init_state(init_state)
-    if obs0 is None:
-        obs0 = env.reset()
-    state_obs_key = find_state_key(obs0)
-    if state_obs_key is None:
-        raise ValueError("Cannot infer state dimension from LIBERO observation.")
-    inferred_state_dim = int(np.asarray(obs0[state_obs_key]).reshape(-1).shape[0])
-    image_keys = find_image_keys(obs0)
-    n_cams = min(2, max(1, len(image_keys)))
-
-    # 4) Build our self-written model.
-    cfg = Pi0CustomConfig(
-        vocab_size=int(getattr(tokenizer, "vocab_size", len(tokenizer))),
-        max_text_len=48,
-        image_size=args.camera_height,
-        n_cams=n_cams,
-        state_dim=inferred_state_dim,
-        action_dim=env_action_dim,
-        action_horizon=args.action_horizon,
-        hidden_dim=args.hidden_dim,
-        cond_dim=args.hidden_dim,
-        num_layers=args.num_layers,
-        num_heads=args.num_heads,
-        dropout=args.dropout,
-        image_keys=[f"observation.images.cam{i}" for i in range(n_cams)],
-    )
-    model = Pi0CustomModel(cfg).to(device).eval()
-
-    # 5) Load HF checkpoint tensors into our model (strictly through our own loader).
-    report = load_hf_weights_into_custom_model(
-        model=model,
-        model_id_or_path=str(ckpt_dir),
-        cache_dir=args.cache_dir,
-        local_files_only=True,
-        min_match_ratio_by_params=args.min_load_ratio,
-    )
-    print("[load-report]")
-    print(
-        f"  keys: {report.loaded_keys}/{report.total_model_keys} "
-        f"({report.match_ratio_by_keys:.2%})"
-    )
-    print(
-        f"  params: {report.loaded_params}/{report.total_model_params} "
-        f"({report.match_ratio_by_params:.2%})"
-    )
-    print(f"  missing_keys(top10): {report.missing_keys[:10]}")
-    print(f"  unexpected_keys(top10): {report.unexpected_keys[:10]}")
-
-    # 6) Rollout.
-    successes = 0
-    for ep in range(args.episodes):
-        env.reset()
-        init_state = init_states[args.init_state_id % len(init_states)]
-        obs = env.set_init_state(init_state)
-        if obs is None:
-            obs = env.reset()
-
-        ep_return = 0.0
-        done = False
-        for step_idx in range(args.steps):
-            images, state, input_ids, attention_mask = build_model_inputs(
-                obs=obs,
-                instruction=task_instruction,
-                tokenizer=tokenizer,
-                cfg=cfg,
-                device=device,
-                debug=args.debug and ep == 0 and step_idx == 0,
-            )
-            with torch.inference_mode():
-                action = model.select_action(
-                    images=images,
-                    state=state,
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    denoise_steps=args.denoise_steps,
-                    trace=args.trace and ep == 0 and step_idx < 2,
-                )
-            env_action = to_env_action(action[0], env)
-            step_out = env.step(env_action)
-            if len(step_out) == 5:
-                obs, reward, terminated, truncated, info = step_out
-                done = bool(terminated or truncated)
-            else:
-                obs, reward, done, info = step_out
-            ep_return += float(reward)
-            if done:
-                break
-
-        success = bool(ep_return > 0.0)
-        successes += int(success)
-        print(
-            f"[episode {ep}] steps={step_idx+1} return={ep_return:.2f} "
-            f"success={success} done={done}"
+        # 2) Resolve checkpoint directory and tokenizer.
+        ckpt_dir = resolve_hf_checkpoint_dir(
+            args.policy_path,
+            cache_dir=args.cache_dir,
+            local_files_only=args.local_files_only,
+        )
+        tokenizer = AutoTokenizer.from_pretrained(
+            str(ckpt_dir),
+            local_files_only=True,  # already resolved to local dir
+            use_fast=True,
         )
 
-    env.close()
-    print(f"[summary] success_rate={successes}/{args.episodes}={(successes / max(1,args.episodes)):.2%}")
+        # 3) Infer state dim from the first observation.
+        env.reset()
+        init_state = init_states[args.init_state_id % len(init_states)]
+        obs0 = env.set_init_state(init_state)
+        if obs0 is None:
+            obs0 = env.reset()
+        state_obs_key = find_state_key(obs0)
+        if state_obs_key is None:
+            raise ValueError("Cannot infer state dimension from LIBERO observation.")
+        inferred_state_dim = int(np.asarray(obs0[state_obs_key]).reshape(-1).shape[0])
+        image_keys = find_image_keys(obs0)
+        n_cams = min(2, max(1, len(image_keys)))
+
+        # 4) Build our self-written model.
+        cfg = Pi0CustomConfig(
+            vocab_size=int(getattr(tokenizer, "vocab_size", len(tokenizer))),
+            max_text_len=48,
+            image_size=args.camera_height,
+            n_cams=n_cams,
+            state_dim=inferred_state_dim,
+            action_dim=env_action_dim,
+            action_horizon=args.action_horizon,
+            hidden_dim=args.hidden_dim,
+            cond_dim=args.hidden_dim,
+            num_layers=args.num_layers,
+            num_heads=args.num_heads,
+            dropout=args.dropout,
+            image_keys=[f"observation.images.cam{i}" for i in range(n_cams)],
+        )
+        model = Pi0CustomModel(cfg).to(device).eval()
+
+        # 5) Load HF checkpoint tensors into our model (strictly through our own loader).
+        report = load_hf_weights_into_custom_model(
+            model=model,
+            model_id_or_path=str(ckpt_dir),
+            cache_dir=args.cache_dir,
+            local_files_only=True,
+            min_match_ratio_by_params=args.min_load_ratio,
+        )
+        print("[load-report]")
+        print(
+            f"  keys: {report.loaded_keys}/{report.total_model_keys} "
+            f"({report.match_ratio_by_keys:.2%})"
+        )
+        print(
+            f"  params: {report.loaded_params}/{report.total_model_params} "
+            f"({report.match_ratio_by_params:.2%})"
+        )
+        print(f"  missing_keys(top10): {report.missing_keys[:10]}")
+        print(f"  unexpected_keys(top10): {report.unexpected_keys[:10]}")
+
+        # 6) Rollout.
+        successes = 0
+        for ep in range(args.episodes):
+            env.reset()
+            init_state = init_states[args.init_state_id % len(init_states)]
+            obs = env.set_init_state(init_state)
+            if obs is None:
+                obs = env.reset()
+
+            ep_return = 0.0
+            done = False
+            for step_idx in range(args.steps):
+                images, state, input_ids, attention_mask = build_model_inputs(
+                    obs=obs,
+                    instruction=task_instruction,
+                    tokenizer=tokenizer,
+                    cfg=cfg,
+                    device=device,
+                    debug=args.debug and ep == 0 and step_idx == 0,
+                )
+                with torch.inference_mode():
+                    action = model.select_action(
+                        images=images,
+                        state=state,
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        denoise_steps=args.denoise_steps,
+                        trace=args.trace and ep == 0 and step_idx < 2,
+                    )
+                env_action = to_env_action(action[0], env)
+                step_out = env.step(env_action)
+                if len(step_out) == 5:
+                    obs, reward, terminated, truncated, info = step_out
+                    done = bool(terminated or truncated)
+                else:
+                    obs, reward, done, info = step_out
+                ep_return += float(reward)
+                if done:
+                    break
+
+            success = bool(ep_return > 0.0)
+            successes += int(success)
+            print(
+                f"[episode {ep}] steps={step_idx+1} return={ep_return:.2f} "
+                f"success={success} done={done}"
+            )
+
+        print(f"[summary] success_rate={successes}/{args.episodes}={(successes / max(1,args.episodes)):.2%}")
+    finally:
+        try:
+            env.close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
